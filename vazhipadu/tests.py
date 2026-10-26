@@ -1,5 +1,8 @@
+import concurrent.futures
 from decimal import Decimal
-from django.test import TestCase
+from django.db import connection
+from django.db.models import Sum
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -288,4 +291,148 @@ class VazhipaduAPITests(TestCase):
         results = response.data['results']
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]['id'], o1.id)
+
+    def test_daily_limit_acceptance_criterion(self):
+        """
+        P3 Acceptance criterion:
+        With a daily limit of 5 and 4 already booked, an order for 2 is rejected
+        and an order for 1 succeeds.
+        """
+        pooja = Offering.objects.create(
+            temple=self.temple,
+            name="Udayasthamana Pooja",
+            price=Decimal('100.00'),
+            is_active=True,
+            daily_limit=5,
+        )
+
+        booking_date = "2026-11-18"
+        # Book 4 already
+        initial_order = Order.objects.create(
+            temple=self.temple,
+            devotee_name="Initial Devotee",
+            phone_number="9123456780",
+            date=booking_date,
+            total_amount=Decimal('400.00'),
+            status=Order.Status.CONFIRMED,
+        )
+        OrderItem.objects.create(
+            order=initial_order,
+            offering=pooja,
+            devotee_name="Initial Devotee",
+            nakshatra="Rohini",
+            quantity=4,
+            unit_price=Decimal('100.00'),
+            total_price=Decimal('400.00'),
+        )
+
+        url = reverse('order-list')
+
+        # Try to order 2 -> should be rejected (4 + 2 = 6 > 5)
+        payload_2 = {
+            "temple": self.temple.id,
+            "devotee_name": "Devotee Over",
+            "phone_number": "9123456781",
+            "date": booking_date,
+            "items": [
+                {
+                    "offering_id": pooja.id,
+                    "quantity": 2,
+                    "devotee_name": "Devotee Over",
+                    "nakshatra": "Makayiram",
+                }
+            ],
+        }
+        res_2 = self.client.post(url, payload_2, format='json')
+        self.assertEqual(res_2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(res_2.data['error']['code'], 'VALIDATION_ERROR')
+        self.assertIn("Daily limit exceeded", str(res_2.data['error']['details']))
+
+        # Try to order 1 -> should succeed (4 + 1 = 5 <= 5)
+        payload_1 = {
+            "temple": self.temple.id,
+            "devotee_name": "Devotee Fit",
+            "phone_number": "9123456782",
+            "date": booking_date,
+            "items": [
+                {
+                    "offering_id": pooja.id,
+                    "quantity": 1,
+                    "devotee_name": "Devotee Fit",
+                    "nakshatra": "Thiruvathira",
+                }
+            ],
+        }
+        res_1 = self.client.post(url, payload_1, format='json')
+        self.assertEqual(res_1.status_code, status.HTTP_201_CREATED)
+
+        # Confirm 5 total booked in database
+        total_booked = OrderItem.objects.filter(
+            offering=pooja,
+            order__date=booking_date,
+            order__status=Order.Status.CONFIRMED,
+        ).aggregate(total=Sum('quantity'))['total']
+        self.assertEqual(total_booked, 5)
+
+
+class ConcurrentDailyLimitTests(TransactionTestCase):
+    """
+    P3 Acceptance criterion:
+    An automated test fires 20 simultaneous orders for 1 each against a daily limit of 5.
+    Exactly 5 succeed.
+    """
+    def test_20_simultaneous_orders_against_daily_limit_of_5(self):
+        temple = Temple.objects.create(name="Chottanikkara Temple", code="CKT-001")
+        offering = Offering.objects.create(
+            temple=temple,
+            name="Guruthi Pooja",
+            price=Decimal('50.00'),
+            is_active=True,
+            daily_limit=5,
+        )
+        booking_date = "2026-11-20"
+        url = reverse('order-list')
+
+        def attempt_booking(worker_id):
+            client = APIClient()
+            payload = {
+                "temple": temple.id,
+                "devotee_name": f"Concurrent Devotee {worker_id}",
+                "phone_number": f"90000000{worker_id:02d}",
+                "date": booking_date,
+                "items": [
+                    {
+                        "offering_id": offering.id,
+                        "quantity": 1,
+                        "devotee_name": f"Devotee {worker_id}",
+                        "nakshatra": "Aswathy",
+                    }
+                ],
+            }
+            try:
+                response = client.post(url, payload, format='json')
+                return response.status_code
+            finally:
+                connection.close()
+
+        # Fire 20 simultaneous requests
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(attempt_booking, i) for i in range(20)]
+            status_codes = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+        success_count = sum(1 for sc in status_codes if sc == status.HTTP_201_CREATED)
+        rejected_count = sum(1 for sc in status_codes if sc == status.HTTP_400_BAD_REQUEST)
+
+        # Acceptance criterion: Exactly 5 succeed, and 15 are rejected
+        self.assertEqual(success_count, 5, f"Expected 5 successes, but got {success_count}. Statuses: {status_codes}")
+        self.assertEqual(rejected_count, 15, f"Expected 15 rejections, but got {rejected_count}. Statuses: {status_codes}")
+
+        # Verify database integrity: Total booked quantity for date is exactly 5
+        booked_qty = OrderItem.objects.filter(
+            offering=offering,
+            order__date=booking_date,
+            order__status=Order.Status.CONFIRMED,
+        ).aggregate(total=Sum('quantity'))['total']
+        self.assertEqual(booked_qty, 5)
+
 
