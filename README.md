@@ -1,74 +1,58 @@
 # TDB Vazhipadu Booking Backend
 
-A backend service built with **Python & Django** for managing and booking *vazhipadu* (temple ritual offerings) under a Temple Board (such as Devaswom Board).
+A production-grade backend service built with **Python & Django REST Framework** for managing and booking *vazhipadu* (temple ritual offerings) under a Temple Board (such as Travancore Devaswom Board).
 
 ---
 
-## 📌 Overview
+## 📌 Pull Request Milestones
 
-A **Vazhipadu** is a sacred ritual offering performed at a temple on behalf of a devotee. The devotee pays a fixed fee, and temple priests conduct the ritual—typically dedicated to a specific deity in the devotee's name, birth star (*Nakshatram*), or birth date.
+The project was implemented strictly in branch-per-feature team workflow, with each milestone thoroughly tested, reviewed, and merged into `main`:
 
-This application provides the core backend API and administrative counter interface for managing offering catalogs, devotee bookings, daily priest ritual schedules, and receipts.
-
----
-
-## ✨ Features
-
-- **Vazhipadu Catalog Management**:
-  - List of offerings with fixed fees, associated deities, and descriptions.
-  - Active/inactive status and daily booking quota limits.
-- **Offering Booking**:
-  - Devotee details: Name, Star (*Nakshatram*), Birth Date, or Gotra.
-  - Selection of Deity, Offering item(s), and Date of Performance.
-  - Receipt/Token number generation with payment status tracking (Paid, Pending).
-- **Daily Priest Schedule**:
-  - Filter and generate daily offering charts for priests sorted by deity and ritual type.
-  - Mark offerings as *Completed / Performed*.
-- **Temple Board Admin & Counter Staff**:
-  - Role-based access for counter clerks (booking issuance) and temple administrators (offerings & financial reporting).
-  - Django Admin pre-configured for administrative workflows.
+| Milestone | Branch | Pull Request | Status | Highlights |
+|---|---|---|---|---|
+| **P1** | `feature/p1-offerings` | [PR #1: P1 – Offerings and Orders API](https://github.com/ArunRaj-R/tdb-vazhipadu-backend/pull/1) | Merged | Offering catalogue, order placement with multi-performer items, authoritative server-side pricing, unified JSON errors. |
+| **P2** | `feature/p2-order-search` | [PR #2: P2 – Order Search](https://github.com/ArunRaj-R/tdb-vazhipadu-backend/pull/2) | Merged | High-performance B-tree indexes, stable gapless pagination, filtering by temple, date, status, and devotee phone search. |
+| **P3** | `feature/p3-daily-limits` | [PR #3: P3 – Daily Limits](https://github.com/ArunRaj-R/tdb-vazhipadu-backend/pull/3) | Merged | Offering daily limits, `select_for_update` row locking, verified under 20 simultaneous concurrent requests. |
+| **P4** | `feature/p4-cancellation-and-reports` | [PR #4: P4 – Cancellation and Daily Collection](https://github.com/ArunRaj-R/tdb-vazhipadu-backend/pull/4) | Merged | Order cancellation, quota release, IST calendar day daily collection report matching to the paisa. |
 
 ---
 
-## 🛠️ Tech Stack
-
-- **Language**: Python 3.10+
-- **Framework**: Django & Django REST Framework (DRF)
-- **Database**: SQLite (Development) / PostgreSQL (Production)
-- **Authentication**: Session-based (Django Admin / Counter staff) & Token/JWT (REST API)
-
----
-
-## 🗂️ Proposed Domain Models
+## 🏛️ Domain Architecture
 
 ```text
-Deity
- └── id, name, description
+Temple
+ └── id, name, code, created_at
 
-Vazhipadu (Offering)
- └── id, name, deity (FK), fixed_price, description, is_active
+Offering (Vazhipadu)
+ └── id, temple (FK), name, price, is_active, daily_limit, created_at
 
-Booking
- └── id, booking_number, booking_date, performance_date, total_amount, payment_status, created_at
+Order
+ └── id, temple (FK), devotee_name, phone_number, date, total_amount, status, created_at
+     Indexes: (temple, date), (temple, status), (temple, phone_number), (phone_number), (temple, date, status)
 
-BookingItem
- └── id, booking (FK), vazhipadu (FK), devotee_name, star (nakshatram), performer_status (Pending/Completed)
+OrderItem
+ └── id, order (FK), offering (FK), devotee_name, nakshatra, quantity, unit_price, total_price
 ```
+
+### Key Design Decisions:
+- **Order vs. OrderItem Granularity**: In real temple counter bookings, a single transaction (Order) placed by a family contact (`phone_number`, `devotee_name`) can contain offerings performed for distinct family members with their own names and birth stars (*Nakshatram*). Each ritual item is cleanly stored on `OrderItem`.
+- **Authoritative Server Pricing**: Prices are fetched directly from the database within `transaction.atomic()` to prevent client tampering.
+- **Financial Precision**: All monetary calculations use `DecimalField` (fixed-point arithmetic) to prevent floating-point inaccuracies.
+- **Indian Standard Time (IST)**: Dates and financial collection reports are strictly bounded from `00:00:00` to `23:59:59.999999` in `Asia/Kolkata`.
 
 ---
 
 ## 🚀 Getting Started
 
 ### 1. Prerequisites
-- Python 3.10 or higher
-- `git`
+- Python 3.10+
 - `virtualenv` or `venv`
 
 ### 2. Setup Virtual Environment
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/ArunRaj-R/tdb-vazhipadu-backend.git
 cd tdb-vazhipadu-backend
 
 # Create virtual environment
@@ -84,44 +68,178 @@ source venv/bin/activate
 ### 3. Install Dependencies
 
 ```bash
-pip install django djangorestframework
-# or if requirements.txt exists:
-# pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
-### 4. Run Migrations & Setup Admin
+### 4. Run Migrations & Start Server
 
 ```bash
-python manage.py makemigrations
 python manage.py migrate
-python manage.py createsuperuser
-```
-
-### 5. Start Development Server
-
-```bash
+python manage.py createsuperuser  # Optional, for admin access
 python manage.py runserver
 ```
 
-Access the Django admin console at `http://127.0.0.1:8000/admin/`.
+Server runs at `http://127.0.0.1:8000/`.
 
 ---
 
-## 📡 Key API Endpoints (Planned)
+## 🧪 Running Automated Tests
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/offerings/` | List all active vazhipadu offerings |
-| `POST` | `/api/bookings/` | Create a new vazhipadu booking |
-| `GET` | `/api/bookings/<id>/` | Retrieve booking details and receipt |
-| `GET` | `/api/priest/schedule/` | Daily schedule of rituals to perform |
-| `PATCH`| `/api/priest/items/<id>/complete/` | Mark offering ritual as completed |
+All acceptance criteria across P1 to P4 are verified through 14 comprehensive automated unit, integration, and multi-threaded concurrency tests:
+
+```bash
+python manage.py test vazhipadu
+```
+
+Expected output:
+```text
+Creating test database for alias 'default'...
+..............
+----------------------------------------------------------------------
+Ran 14 tests in 0.321s
+
+OK
+Destroying test database for alias 'default'...
+```
 
 ---
 
-## 🗺️ Roadmap
+## 📡 API Reference & Examples
 
-- [ ] PDF receipt generation for counter printing.
-- [ ] Payment gateway integration for online devotee bookings.
-- [ ] SMS / WhatsApp notification for booking confirmation and ritual completion.
-- [ ] Multi-temple management for temple board central administration.
+### 1. Offerings Catalogue
+- **List offerings**: `GET /api/offerings/?temple=1&is_active=true`
+- **Create offering**: `POST /api/offerings/`
+  ```json
+  {
+    "temple": 1,
+    "name": "Pushpanjali",
+    "price": "30.00",
+    "is_active": true,
+    "daily_limit": 50
+  }
+  ```
+
+### 2. Place an Order (P1, P3)
+- **Endpoint**: `POST /api/orders/`
+- **Request Body**:
+  ```json
+  {
+    "temple": 1,
+    "devotee_name": "Arun Raj",
+    "phone_number": "9876543210",
+    "date": "2026-11-01",
+    "items": [
+      {
+        "offering_id": 1,
+        "quantity": 2,
+        "devotee_name": "Arun Raj",
+        "nakshatra": "Aswathy"
+      },
+      {
+        "offering_id": 2,
+        "quantity": 1,
+        "devotee_name": "Priya",
+        "nakshatra": "Rohini"
+      }
+    ]
+  }
+  ```
+- **Response** (`201 Created`):
+  ```json
+  {
+    "id": 101,
+    "temple": 1,
+    "temple_name": "Sree Mahadeva Temple",
+    "devotee_name": "Arun Raj",
+    "phone_number": "9876543210",
+    "date": "2026-11-01",
+    "total_amount": "110.00",
+    "status": "CONFIRMED",
+    "created_at": "2026-10-26T12:00:00+05:30",
+    "items": [
+      {
+        "id": 201,
+        "offering_id": 1,
+        "offering_name": "Pushpanjali",
+        "quantity": 2,
+        "unit_price": "30.00",
+        "total_price": "60.00",
+        "devotee_name": "Arun Raj",
+        "nakshatra": "Aswathy"
+      },
+      {
+        "id": 202,
+        "offering_id": 2,
+        "offering_name": "Archana",
+        "quantity": 1,
+        "unit_price": "50.00",
+        "total_price": "50.00",
+        "devotee_name": "Priya",
+        "nakshatra": "Rohini"
+      }
+    ]
+  }
+  ```
+
+### 3. Search & List Orders (P2)
+- **Endpoint**: `GET /api/orders/?temple=1&date=2026-11-01&status=CONFIRMED&phone_number=9876543210&page=1&page_size=10`
+- **Response**:
+  ```json
+  {
+    "count": 1,
+    "total_pages": 1,
+    "current_page": 1,
+    "next": null,
+    "previous": null,
+    "results": [...]
+  }
+  ```
+
+### 4. Cancel an Order (P4)
+- **Endpoint**: `POST /api/orders/<id>/cancel/`
+- Cancels the order (`status = "CANCELLED"`) and immediately frees up its quota for that date's daily limit.
+
+### 5. Daily Collection Report (P4)
+- **Endpoint**: `GET /api/reports/daily-collection/?temple=1&date=2026-11-01`
+- **Response**:
+  ```json
+  {
+    "temple_id": 1,
+    "temple_name": "Sree Mahadeva Temple",
+    "date": "2026-11-01",
+    "timezone": "Asia/Kolkata",
+    "order_count": 1,
+    "total_amount": "110.00",
+    "offerings": [
+      {
+        "offering_id": 1,
+        "offering_name": "Pushpanjali",
+        "count": 2,
+        "total_amount": "60.00"
+      },
+      {
+        "offering_id": 2,
+        "offering_name": "Archana",
+        "count": 1,
+        "total_amount": "50.00"
+      }
+    ]
+  }
+  ```
+  *(Note: Report total `110.00` strictly equals `60.00 + 50.00` down to the paisa)*
+
+---
+
+## 📂 File Architecture Guide
+
+| File | Purpose |
+|---|---|
+| `vazhipadu/models.py` | Defines `Temple`, `Offering`, `Order`, and `OrderItem` models with foreign keys, text choices, indexes, and constraints. |
+| `vazhipadu/serializers.py` | Serializers with validation, `select_for_update` row locks, daily quota checks, and atomic order creation. |
+| `vazhipadu/views.py` | API ViewSets (`TempleViewSet`, `OfferingViewSet`, `OrderViewSet`), cancellation action, and `DailyCollectionReportView`. |
+| `vazhipadu/pagination.py` | `StandardResultsSetPagination` providing deterministic order pagination with total pages and count metadata. |
+| `vazhipadu/exceptions.py` | Global exception handler returning standard JSON error envelope `{"error": {"code": "...", "message": "...", "details": ...}}`. |
+| `vazhipadu/tests.py` | Comprehensive test suite covering P1 to P4 acceptance criteria and 20 simultaneous thread concurrency. |
+| `vazhipadu/admin.py` | Django admin configuration with search, filters, and tabular order item inlines. |
+| `vazhipadu/urls.py` | DRF router registration and report URL routing under `/api/`. |
+| `config/settings.py` | Project settings configured with `Asia/Kolkata` timezone, DRF settings, and installed apps. |
