@@ -1,4 +1,6 @@
 import concurrent.futures
+import zoneinfo
+from datetime import datetime
 from decimal import Decimal
 from django.db import connection
 from django.db.models import Sum
@@ -373,6 +375,169 @@ class VazhipaduAPITests(TestCase):
             order__status=Order.Status.CONFIRMED,
         ).aggregate(total=Sum('quantity'))['total']
         self.assertEqual(total_booked, 5)
+
+    def test_order_cancellation_frees_daily_limit_and_excludes_from_report(self):
+        """
+        P4 Acceptance criteria:
+        - Staff can cancel an order. A cancelled order frees its daily limit.
+        - A cancelled order is not counted in the report, and its daily limit becomes available again.
+        """
+        from django.utils import timezone
+
+        offering = Offering.objects.create(
+            temple=self.temple,
+            name="Special Pooja",
+            price=Decimal('100.00'),
+            is_active=True,
+            daily_limit=2,
+        )
+        booking_date = "2026-11-25"
+        url = reverse('order-list')
+
+        # Devotee 1 books 2 (reaches limit)
+        res1 = self.client.post(url, {
+            "temple": self.temple.id,
+            "devotee_name": "Devotee 1",
+            "phone_number": "9111111111",
+            "date": booking_date,
+            "items": [{"offering_id": offering.id, "quantity": 2, "nakshatra": "Rohini"}],
+        }, format='json')
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+        order1_id = res1.data['id']
+
+        # Devotee 2 attempts to book 1 -> rejected due to daily limit
+        res2 = self.client.post(url, {
+            "temple": self.temple.id,
+            "devotee_name": "Devotee 2",
+            "phone_number": "9222222222",
+            "date": booking_date,
+            "items": [{"offering_id": offering.id, "quantity": 1, "nakshatra": "Aswathy"}],
+        }, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Staff cancels order 1
+        cancel_url = reverse('order-cancel', kwargs={'pk': order1_id})
+        cancel_res = self.client.post(cancel_url)
+        self.assertEqual(cancel_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(cancel_res.data['status'], 'CANCELLED')
+
+        # Now Devotee 2 attempts to book 1 again -> succeeds!
+        res2_retry = self.client.post(url, {
+            "temple": self.temple.id,
+            "devotee_name": "Devotee 2",
+            "phone_number": "9222222222",
+            "date": booking_date,
+            "items": [{"offering_id": offering.id, "quantity": 1, "nakshatra": "Aswathy"}],
+        }, format='json')
+        self.assertEqual(res2_retry.status_code, status.HTTP_201_CREATED)
+
+        # Check daily collection report: order 1 must be excluded, only order 2 counted!
+        today_str = str(timezone.localdate())
+        report_url = reverse('daily-collection-report')
+        rep_res = self.client.get(report_url, {'temple': self.temple.id, 'date': today_str})
+        self.assertEqual(rep_res.status_code, status.HTTP_200_OK)
+        # Only Devotee 2's ₹100 is in the report, NOT Devotee 1's ₹200
+        self.assertEqual(Decimal(rep_res.data['total_amount']), Decimal('100.00'))
+        self.assertEqual(rep_res.data['order_count'], 1)
+
+    def test_order_placed_at_0015_ist_counted_on_that_date(self):
+        """
+        P4 Acceptance criterion:
+        An order placed at 00:15 IST on a date is counted on that date.
+        """
+        ist = zoneinfo.ZoneInfo('Asia/Kolkata')
+        # 2026-12-01 00:15:00 IST corresponds to 2026-11-30 18:45:00 UTC
+        ist_timestamp = datetime(2026, 12, 1, 0, 15, 0, tzinfo=ist)
+
+        order = Order.objects.create(
+            temple=self.temple,
+            devotee_name="Early Bird Devotee",
+            phone_number="9333333333",
+            date="2026-12-05",
+            total_amount=Decimal('80.00'),
+            status=Order.Status.CONFIRMED,
+        )
+        OrderItem.objects.create(
+            order=order,
+            offering=self.archana,
+            devotee_name="Early Bird Devotee",
+            nakshatra="Makayiram",
+            quantity=1,
+            unit_price=Decimal('50.00'),
+            total_price=Decimal('50.00'),
+        )
+        OrderItem.objects.create(
+            order=order,
+            offering=self.pushpanjali,
+            devotee_name="Early Bird Devotee",
+            nakshatra="Makayiram",
+            quantity=1,
+            unit_price=Decimal('30.00'),
+            total_price=Decimal('30.00'),
+        )
+
+        # Explicitly set created_at to 00:15 IST
+        Order.objects.filter(id=order.id).update(created_at=ist_timestamp)
+
+        report_url = reverse('daily-collection-report')
+
+        # Should be counted on 2026-12-01
+        res_dec1 = self.client.get(report_url, {'temple': self.temple.id, 'date': '2026-12-01'})
+        self.assertEqual(res_dec1.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(res_dec1.data['total_amount']), Decimal('80.00'))
+        self.assertEqual(res_dec1.data['order_count'], 1)
+
+        # Should NOT be counted on 2026-11-30
+        res_nov30 = self.client.get(report_url, {'temple': self.temple.id, 'date': '2026-11-30'})
+        self.assertEqual(res_nov30.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(res_nov30.data['total_amount']), Decimal('0.00'))
+        self.assertEqual(res_nov30.data['order_count'], 0)
+
+    def test_daily_collection_report_total_equals_sum_of_offerings_totals_to_the_paisa(self):
+        """
+        P4 Acceptance criterion:
+        The report total equals the sum of its offerings' totals to the paisa.
+        """
+        o1 = Offering.objects.create(temple=self.temple, name="P1", price=Decimal('33.33'))
+        o2 = Offering.objects.create(temple=self.temple, name="P2", price=Decimal('66.67'))
+        o3 = Offering.objects.create(temple=self.temple, name="P3", price=Decimal('100.50'))
+
+        order_date = "2026-12-10"
+        order1 = Order.objects.create(
+            temple=self.temple,
+            devotee_name="D1",
+            phone_number="9444444441",
+            date=order_date,
+            total_amount=Decimal('133.33'),
+            status=Order.Status.CONFIRMED,
+        )
+        OrderItem.objects.create(order=order1, offering=o1, devotee_name="D1", nakshatra="Star1", quantity=2, unit_price=Decimal('33.33'), total_price=Decimal('66.66'))
+        OrderItem.objects.create(order=order1, offering=o2, devotee_name="D1", nakshatra="Star1", quantity=1, unit_price=Decimal('66.67'), total_price=Decimal('66.67'))
+
+        order2 = Order.objects.create(
+            temple=self.temple,
+            devotee_name="D2",
+            phone_number="9444444442",
+            date=order_date,
+            total_amount=Decimal('201.00'),
+            status=Order.Status.CONFIRMED,
+        )
+        OrderItem.objects.create(order=order2, offering=o3, devotee_name="D2", nakshatra="Star2", quantity=2, unit_price=Decimal('100.50'), total_price=Decimal('201.00'))
+
+        # Set created_at to 2026-12-10 in IST
+        ist = zoneinfo.ZoneInfo('Asia/Kolkata')
+        ist_time = datetime(2026, 12, 10, 11, 30, 0, tzinfo=ist)
+        Order.objects.filter(id__in=[order1.id, order2.id]).update(created_at=ist_time)
+
+        report_url = reverse('daily-collection-report')
+        res = self.client.get(report_url, {'temple': self.temple.id, 'date': '2026-12-10'})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        report_total = Decimal(res.data['total_amount'])
+        offerings_sum = sum(Decimal(off['total_amount']) for off in res.data['offerings'])
+
+        self.assertEqual(report_total, offerings_sum)
+        self.assertEqual(report_total, Decimal('334.33'))
 
 
 class ConcurrentDailyLimitTests(TransactionTestCase):
