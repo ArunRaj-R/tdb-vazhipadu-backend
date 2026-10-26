@@ -16,7 +16,7 @@ class OfferingSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Offering
-        fields = ['id', 'temple', 'temple_name', 'name', 'price', 'is_active', 'created_at']
+        fields = ['id', 'temple', 'temple_name', 'name', 'price', 'is_active', 'daily_limit', 'created_at']
 
     def validate_price(self, value):
         if value <= 0:
