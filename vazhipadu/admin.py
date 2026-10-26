@@ -10,7 +10,7 @@ class TempleAdmin(admin.ModelAdmin):
 
 @admin.register(Offering)
 class OfferingAdmin(admin.ModelAdmin):
-    list_display = ('id', 'name', 'temple', 'price', 'is_active', 'created_at')
+    list_display = ('id', 'name', 'temple', 'price', 'is_active', 'daily_limit', 'created_at')
     list_filter = ('temple', 'is_active')
     search_fields = ('name',)
 
