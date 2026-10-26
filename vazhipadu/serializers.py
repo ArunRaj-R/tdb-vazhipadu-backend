@@ -1,5 +1,7 @@
+from collections import defaultdict
 from decimal import Decimal
 from django.db import transaction
+from django.db.models import Sum
 from rest_framework import serializers
 
 from .models import Temple, Offering, Order, OrderItem
@@ -69,9 +71,10 @@ class OrderCreateSerializer(serializers.Serializer):
 
         with transaction.atomic():
             offering_ids = [item['offering_id'] for item in items_data]
+            unique_offering_ids = sorted(list(set(offering_ids)))
             offerings = {
                 o.id: o
-                for o in Offering.objects.filter(id__in=offering_ids, temple=temple)
+                for o in Offering.objects.select_for_update().filter(id__in=unique_offering_ids, temple=temple)
             }
 
             # Check for invalid offering IDs
@@ -88,6 +91,30 @@ class OrderCreateSerializer(serializers.Serializer):
                     raise serializers.ValidationError({
                         "items": f"Offering '{offering.name}' is currently inactive and cannot be booked."
                     })
+
+            # Calculate total requested quantities per offering in this order
+            requested_quantities = defaultdict(int)
+            for item_input in items_data:
+                requested_quantities[item_input['offering_id']] += item_input['quantity']
+
+            # Enforce daily limit for each offering
+            for offering_id, req_qty in requested_quantities.items():
+                offering = offerings[offering_id]
+                if offering.daily_limit is not None:
+                    already_booked = OrderItem.objects.filter(
+                        offering=offering,
+                        order__date=booking_date,
+                        order__status=Order.Status.CONFIRMED,
+                    ).aggregate(total=Sum('quantity'))['total'] or 0
+
+                    if already_booked + req_qty > offering.daily_limit:
+                        available = max(0, offering.daily_limit - already_booked)
+                        raise serializers.ValidationError({
+                            "items": (
+                                f"Daily limit exceeded for offering '{offering.name}' on {booking_date}. "
+                                f"Daily limit: {offering.daily_limit}, already booked: {already_booked}, available: {available}."
+                            )
+                        })
 
             # Server computes order total
             total_amount = Decimal('0.00')
