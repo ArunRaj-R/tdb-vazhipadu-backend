@@ -40,6 +40,13 @@ class Order(models.Model):
 
     class Meta:
         ordering = ['-created_at', '-id']
+        indexes = [
+            models.Index(fields=['temple', 'date'], name='idx_order_temple_date'),
+            models.Index(fields=['temple', 'status'], name='idx_order_temple_status'),
+            models.Index(fields=['temple', 'phone_number'], name='idx_order_temple_phone'),
+            models.Index(fields=['phone_number'], name='idx_order_phone'),
+            models.Index(fields=['temple', 'date', 'status'], name='idx_order_temple_dt_st'),
+        ]
 
     def __str__(self):
         return f"Order #{self.id} - {self.devotee_name} ({self.date})"
