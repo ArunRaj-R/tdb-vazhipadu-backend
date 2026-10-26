@@ -172,3 +172,120 @@ class VazhipaduAPITests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
         self.assertIn("error", response.data)
         self.assertEqual(response.data['error']['code'], 'NOT_FOUND')
+
+    def test_search_by_phone_number_returns_only_that_devotees_orders(self):
+        """
+        P2 Acceptance criterion:
+        Searching by phone number returns only that devotee's orders.
+        """
+        target_phone = "9447012345"
+        other_phone = "9847999888"
+
+        for i in range(3):
+            Order.objects.create(
+                temple=self.temple,
+                devotee_name=f"Devotee A{i}",
+                phone_number=target_phone,
+                date="2026-11-10",
+                total_amount=Decimal('30.00'),
+            )
+        for i in range(2):
+            Order.objects.create(
+                temple=self.temple,
+                devotee_name=f"Devotee B{i}",
+                phone_number=other_phone,
+                date="2026-11-10",
+                total_amount=Decimal('50.00'),
+            )
+
+        url = reverse('order-list')
+        response = self.client.get(url, {'phone_number': target_phone})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data['results']
+        self.assertEqual(len(results), 3)
+        self.assertEqual(response.data['count'], 3)
+        for order in results:
+            self.assertEqual(order['phone_number'], target_phone)
+
+    def test_pagination_page_2_no_repeats_no_gaps(self):
+        """
+        P2 Acceptance criterion:
+        Requesting page 2 returns the next set of results, with no repeats or gaps from page 1.
+        """
+        created_orders = []
+        for i in range(25):
+            order = Order.objects.create(
+                temple=self.temple,
+                devotee_name=f"Pagination Devotee {i:02d}",
+                phone_number="9111222333",
+                date="2026-11-12",
+                total_amount=Decimal('30.00'),
+            )
+            created_orders.append(order)
+
+        url = reverse('order-list')
+        # Page 1
+        response_page1 = self.client.get(url, {'page': 1, 'page_size': 10})
+        self.assertEqual(response_page1.status_code, status.HTTP_200_OK)
+        page1_results = response_page1.data['results']
+        self.assertEqual(len(page1_results), 10)
+        self.assertEqual(response_page1.data['current_page'], 1)
+        self.assertIsNotNone(response_page1.data['next'])
+
+        # Page 2
+        response_page2 = self.client.get(url, {'page': 2, 'page_size': 10})
+        self.assertEqual(response_page2.status_code, status.HTTP_200_OK)
+        page2_results = response_page2.data['results']
+        self.assertEqual(len(page2_results), 10)
+        self.assertEqual(response_page2.data['current_page'], 2)
+
+        page1_ids = [item['id'] for item in page1_results]
+        page2_ids = [item['id'] for item in page2_results]
+
+        # No repeats between page 1 and page 2
+        intersection = set(page1_ids).intersection(set(page2_ids))
+        self.assertEqual(len(intersection), 0, f"Found overlapping order IDs: {intersection}")
+
+        # No gaps: since ordered by -created_at, -id, the lowest id on page 1 is strictly greater than highest on page 2
+        self.assertTrue(min(page1_ids) > max(page2_ids))
+
+    def test_filter_by_temple_date_and_status(self):
+        """Test filtering orders by temple, date, and status."""
+        other_temple = Temple.objects.create(name="Sri Krishna Temple", code="SKT-002")
+
+        o1 = Order.objects.create(
+            temple=self.temple,
+            devotee_name="Anand",
+            phone_number="9000000001",
+            date="2026-11-15",
+            status=Order.Status.CONFIRMED,
+            total_amount=Decimal('30.00'),
+        )
+        o2 = Order.objects.create(
+            temple=self.temple,
+            devotee_name="Bindu",
+            phone_number="9000000002",
+            date="2026-11-15",
+            status=Order.Status.CANCELLED,
+            total_amount=Decimal('50.00'),
+        )
+        o3 = Order.objects.create(
+            temple=other_temple,
+            devotee_name="Chandran",
+            phone_number="9000000003",
+            date="2026-11-15",
+            status=Order.Status.CONFIRMED,
+            total_amount=Decimal('30.00'),
+        )
+
+        url = reverse('order-list')
+        response = self.client.get(url, {
+            'temple': self.temple.id,
+            'date': '2026-11-15',
+            'status': 'CONFIRMED',
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data['results']
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['id'], o1.id)
+
