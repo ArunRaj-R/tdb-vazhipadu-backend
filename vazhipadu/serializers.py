@@ -1,8 +1,14 @@
+import contextlib
+import threading
+import time
 from collections import defaultdict
 from decimal import Decimal
-from django.db import transaction
+from django.db import connection, transaction
 from django.db.models import Sum
 from rest_framework import serializers
+
+# SQLite uses database/table-level write locks; in multi-threaded environments, serialize SQLite writes.
+_sqlite_lock = threading.RLock()
 
 from .models import Temple, Offering, Order, OrderItem
 
@@ -69,93 +75,96 @@ class OrderCreateSerializer(serializers.Serializer):
         booking_date = validated_data['date']
         items_data = validated_data['items']
 
-        with transaction.atomic():
-            offering_ids = [item['offering_id'] for item in items_data]
-            unique_offering_ids = sorted(list(set(offering_ids)))
-            offerings = {
-                o.id: o
-                for o in Offering.objects.select_for_update().filter(id__in=unique_offering_ids, temple=temple)
-            }
+        lock_context = _sqlite_lock if connection.vendor == 'sqlite' else contextlib.nullcontext()
 
-            # Check for invalid offering IDs
-            missing_ids = set(offering_ids) - set(offerings.keys())
-            if missing_ids:
-                raise serializers.ValidationError({
-                    "items": f"Offerings with IDs {list(missing_ids)} do not exist for this temple."
-                })
+        with lock_context:
+            with transaction.atomic():
+                offering_ids = [item['offering_id'] for item in items_data]
+                unique_offering_ids = sorted(list(set(offering_ids)))
+                offerings = {
+                    o.id: o
+                    for o in Offering.objects.select_for_update().filter(id__in=unique_offering_ids, temple=temple)
+                }
 
-            # Check for inactive offerings
-            for item_input in items_data:
-                offering = offerings[item_input['offering_id']]
-                if not offering.is_active:
+                # Check for invalid offering IDs
+                missing_ids = set(offering_ids) - set(offerings.keys())
+                if missing_ids:
                     raise serializers.ValidationError({
-                        "items": f"Offering '{offering.name}' is currently inactive and cannot be booked."
+                        "items": f"Offerings with IDs {list(missing_ids)} do not exist for this temple."
                     })
 
-            # Calculate total requested quantities per offering in this order
-            requested_quantities = defaultdict(int)
-            for item_input in items_data:
-                requested_quantities[item_input['offering_id']] += item_input['quantity']
-
-            # Enforce daily limit for each offering
-            for offering_id, req_qty in requested_quantities.items():
-                offering = offerings[offering_id]
-                if offering.daily_limit is not None:
-                    already_booked = OrderItem.objects.filter(
-                        offering=offering,
-                        order__date=booking_date,
-                        order__status=Order.Status.CONFIRMED,
-                    ).aggregate(total=Sum('quantity'))['total'] or 0
-
-                    if already_booked + req_qty > offering.daily_limit:
-                        available = max(0, offering.daily_limit - already_booked)
+                # Check for inactive offerings
+                for item_input in items_data:
+                    offering = offerings[item_input['offering_id']]
+                    if not offering.is_active:
                         raise serializers.ValidationError({
-                            "items": (
-                                f"Daily limit exceeded for offering '{offering.name}' on {booking_date}. "
-                                f"Daily limit: {offering.daily_limit}, already booked: {already_booked}, available: {available}."
-                            )
+                            "items": f"Offering '{offering.name}' is currently inactive and cannot be booked."
                         })
 
-            # Server computes order total
-            total_amount = Decimal('0.00')
-            order_items_to_create = []
+                # Calculate total requested quantities per offering in this order
+                requested_quantities = defaultdict(int)
+                for item_input in items_data:
+                    requested_quantities[item_input['offering_id']] += item_input['quantity']
 
-            order = Order.objects.create(
-                temple=temple,
-                devotee_name=devotee_name,
-                phone_number=phone_number,
-                date=booking_date,
-                total_amount=Decimal('0.00'),
-            )
+                # Enforce daily limit for each offering
+                for offering_id, req_qty in requested_quantities.items():
+                    offering = offerings[offering_id]
+                    if offering.daily_limit is not None:
+                        already_booked = OrderItem.objects.filter(
+                            offering=offering,
+                            order__date=booking_date,
+                            order__status=Order.Status.CONFIRMED,
+                        ).aggregate(total=Sum('quantity'))['total'] or 0
 
-            for item_input in items_data:
-                offering = offerings[item_input['offering_id']]
-                quantity = item_input['quantity']
-                unit_price = offering.price
-                item_total = unit_price * quantity
-                total_amount += item_total
+                        if already_booked + req_qty > offering.daily_limit:
+                            available = max(0, offering.daily_limit - already_booked)
+                            raise serializers.ValidationError({
+                                "items": (
+                                    f"Daily limit exceeded for offering '{offering.name}' on {booking_date}. "
+                                    f"Daily limit: {offering.daily_limit}, already booked: {already_booked}, available: {available}."
+                                )
+                            })
 
-                # Devotee name for this ritual item defaults to the booker if not specified
-                item_devotee = item_input.get('devotee_name') or devotee_name
-                item_nakshatra = item_input['nakshatra']
+                # Server computes order total
+                total_amount = Decimal('0.00')
+                order_items_to_create = []
 
-                order_items_to_create.append(
-                    OrderItem(
-                        order=order,
-                        offering=offering,
-                        quantity=quantity,
-                        unit_price=unit_price,
-                        total_price=item_total,
-                        devotee_name=item_devotee,
-                        nakshatra=item_nakshatra,
-                    )
+                order = Order.objects.create(
+                    temple=temple,
+                    devotee_name=devotee_name,
+                    phone_number=phone_number,
+                    date=booking_date,
+                    total_amount=Decimal('0.00'),
                 )
 
-            OrderItem.objects.bulk_create(order_items_to_create)
-            order.total_amount = total_amount
-            order.save(update_fields=['total_amount'])
+                for item_input in items_data:
+                    offering = offerings[item_input['offering_id']]
+                    quantity = item_input['quantity']
+                    unit_price = offering.price
+                    item_total = unit_price * quantity
+                    total_amount += item_total
 
-            return order
+                    # Devotee name for this ritual item defaults to the booker if not specified
+                    item_devotee = item_input.get('devotee_name') or devotee_name
+                    item_nakshatra = item_input['nakshatra']
+
+                    order_items_to_create.append(
+                        OrderItem(
+                            order=order,
+                            offering=offering,
+                            quantity=quantity,
+                            unit_price=unit_price,
+                            total_price=item_total,
+                            devotee_name=item_devotee,
+                            nakshatra=item_nakshatra,
+                        )
+                    )
+
+                OrderItem.objects.bulk_create(order_items_to_create)
+                order.total_amount = total_amount
+                order.save(update_fields=['total_amount'])
+
+                return order
 
 
 class OrderDetailSerializer(serializers.ModelSerializer):
